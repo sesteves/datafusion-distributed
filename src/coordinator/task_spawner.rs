@@ -3,7 +3,7 @@ use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::passthrough_headers::get_passthrough_headers;
-use crate::protobuf::tonic_status_to_datafusion_error;
+use crate::protobuf::map_status_to_datafusion_error;
 use crate::stage::LocalStage;
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
 use crate::worker::generated::worker as pb;
@@ -14,11 +14,11 @@ use crate::{
     DistributedTaskContext, DistributedWorkUnitFeedContext, TaskKey,
     get_distributed_channel_resolver,
 };
+use datafusion::common::DataFusionError;
 use datafusion::common::Result;
 use datafusion::common::instant::Instant;
 use datafusion::common::runtime::JoinSet;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, exec_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr_common::metrics::{
     Count, ExecutionPlanMetricsSet, Label, MetricBuilder, MetricValue, Time,
@@ -201,11 +201,10 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         self.join_set.spawn(async move {
             let start = Instant::now();
             let mut client = channel_resolver.get_worker_client_for_url(&url).await?;
-            let response = client.coordinator_channel(request).await.map_err(|e| {
-                tonic_status_to_datafusion_error(&e).unwrap_or_else(|| {
-                    exec_datafusion_err!("Error sending plan to worker {url}: {e}")
-                })
-            })?;
+            let response = client
+                .coordinator_channel(request)
+                .await
+                .map_err(map_status_to_datafusion_error)?;
             metrics.plan_send_latency.record(&start);
             metrics.plan_bytes_sent.add(plan_size);
             let mut worker_to_coordinator_stream = response.into_inner();
@@ -213,9 +212,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
                 let msg = match msg_or_err {
                     Ok(msg) => msg,
                     Err(err) => {
-                        return Err(tonic_status_to_datafusion_error(err).unwrap_or_else(|| {
-                            exec_datafusion_err!("Unknown error on worker to coordinator stream")
-                        }));
+                        return Err(map_status_to_datafusion_error(err));
                     }
                 };
                 if worker_to_coordinator_tx.send(msg).is_err() {

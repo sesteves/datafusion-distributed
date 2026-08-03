@@ -380,7 +380,7 @@ pub struct ExecutionTaskProto {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DistributedExecProto {
-    #[prost(oneof = "DistributedExecNode", tags = "1, 2, 3, 4, 5, 6")]
+    #[prost(oneof = "DistributedExecNode", tags = "1, 2, 4, 5, 6")]
     pub node: Option<DistributedExecNode>,
 }
 
@@ -569,6 +569,20 @@ mod tests {
 
     fn create_context() -> Arc<TaskContext> {
         SessionContext::new().task_ctx()
+    }
+
+    #[test]
+    fn reserved_tag_returns_decode_error() {
+        let codec = DistributedCodec;
+        let ctx = create_context();
+
+        // Tag 3 was used by the removed PartitionIsolatorExec node.
+        let legacy_partition_isolator = [0x1a, 0x00];
+        assert!(
+            codec
+                .try_decode(&legacy_partition_isolator, &[], &ctx)
+                .is_err()
+        );
     }
 
     #[test]

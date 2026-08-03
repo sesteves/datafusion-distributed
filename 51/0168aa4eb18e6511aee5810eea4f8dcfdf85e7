@@ -1,0 +1,19 @@
+src/coordinator/task_spawner.rs
+  s_17a7bf1bd53b71::t_1f469c4629ee44 6,17,204-207,215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "510168aa4eb18e6511aee5810eea4f8dcfdf85e7",
+  "prompts": {},
+  "sessions": {
+    "s_17a7bf1bd53b71": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0378a5587ffe1BS7PvxEm8CrKH",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

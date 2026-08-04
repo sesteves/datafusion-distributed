@@ -1,4 +1,5 @@
 use crate::common::deserialize_uuid;
+use crate::protobuf::datafusion_error_to_tonic_status;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
 use crate::worker::LocalWorkerContext;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
@@ -7,7 +8,9 @@ use crate::worker::generated::worker::worker_service_server::WorkerService;
 use crate::worker::generated::worker::{
     CoordinatorToWorkerMsg, WorkerToCoordinatorMsg, worker_to_coordinator_msg,
 };
+use crate::worker::single_write_multi_read::SingleWriteMultiRead;
 use crate::worker::task_data::TaskDataMetrics;
+use crate::worker::worker_service::{CancelledTaskKeys, ResultTaskData};
 use crate::{
     DistributedCodec, DistributedConfig, DistributedExt, DistributedTaskContext, TaskData, Worker,
     WorkerQueryContext,
@@ -41,6 +44,7 @@ impl Worker {
             ));
         };
         let key = request.task_key.ok_or_else(missing("task_key"))?;
+        ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key).await?;
 
         let entry = self
             .task_data_entries
@@ -114,33 +118,39 @@ impl Worker {
             })
         };
 
-        entry.write(task_data().await.map_err(Arc::new)).map_err(|_| {
-            Status::internal(format!(
-                "Logic error while setting plan for TaskKey {key:?}: the plan was set twice. This is a bug in datafusion-distributed, please report it."
-            ))
-        })?;
+        publish_task_data(&entry, &key, task_data().await.map_err(Arc::new))?;
+        ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key).await?;
 
         // Continue reading remaining messages (work unit feed data) in the background.
         let mut work_unit_senders = remote_work_unit_feed_registry.senders;
+        let task_data_entries = Arc::clone(&self.task_data_entries);
+        let cancelled_task_keys = Arc::clone(&self.cancelled_task_keys);
+        let cancellation_key = key.clone();
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let mut body = body.map_ok(set_work_unit_received_time);
             while let Some(Ok(msg)) = body.next().await {
-                let Some(Inner::WorkUnitBatch(msg)) = msg.inner else {
-                    continue;
-                };
-                for msg in msg.batch {
-                    let Ok(id) = deserialize_uuid(&msg.id) else {
-                        continue;
-                    };
-                    let partition = msg.partition as usize;
-                    let Some(tx) = work_unit_senders.get(&(id, partition)) else {
-                        continue;
-                    };
-                    if tx.send(Ok(msg)).is_err() {
-                        work_unit_senders.remove(&(id, partition));
-                        continue;
+                match msg.inner {
+                    Some(Inner::WorkUnitBatch(msg)) => {
+                        for msg in msg.batch {
+                            let Ok(id) = deserialize_uuid(&msg.id) else {
+                                continue;
+                            };
+                            let partition = msg.partition as usize;
+                            let Some(tx) = work_unit_senders.get(&(id, partition)) else {
+                                continue;
+                            };
+                            if tx.send(Ok(msg)).is_err() {
+                                work_unit_senders.remove(&(id, partition));
+                            }
+                        }
                     }
+                    Some(Inner::CancelPlanRequest(request)) => {
+                        let key = request.task_key.as_ref().unwrap_or(&cancellation_key);
+                        cancel_published_plan(&task_data_entries, &cancelled_task_keys, key).await;
+                        break;
+                    }
+                    Some(Inner::SetPlanRequest(_)) | None => {}
                 }
             }
         });
@@ -163,4 +173,128 @@ impl Worker {
 
 fn missing(field: &'static str) -> impl FnOnce() -> Status {
     move || Status::invalid_argument(format!("Missing field '{field}'"))
+}
+
+fn cancelled(key: &crate::TaskKey) -> Status {
+    Status::cancelled(format!("Plan publication cancelled for TaskKey {key:?}"))
+}
+
+async fn ensure_plan_not_cancelled(
+    task_data_entries: &crate::worker::worker_service::TaskDataEntries,
+    cancelled_task_keys: &CancelledTaskKeys,
+    key: &crate::TaskKey,
+) -> Result<(), Status> {
+    if cancelled_task_keys.contains_key(key) {
+        task_data_entries.invalidate(key).await;
+        return Err(cancelled(key));
+    }
+    Ok(())
+}
+
+fn publish_task_data(
+    entry: &SingleWriteMultiRead<ResultTaskData>,
+    key: &crate::TaskKey,
+    task_data: ResultTaskData,
+) -> Result<(), Status> {
+    let publication_error = task_data.as_ref().err().cloned();
+    entry.write(task_data).map_err(|_| {
+        Status::internal(format!(
+            "Logic error while setting plan for TaskKey {key:?}: the plan was set twice. This is a bug in datafusion-distributed, please report it."
+        ))
+    })?;
+    if let Some(error) = publication_error {
+        return Err(datafusion_error_to_tonic_status(error.as_ref()));
+    }
+    Ok(())
+}
+
+pub(crate) async fn cancel_published_plan(
+    task_data_entries: &crate::worker::worker_service::TaskDataEntries,
+    cancelled_task_keys: &CancelledTaskKeys,
+    key: &crate::TaskKey,
+) {
+    cancelled_task_keys.insert(key.clone(), ()).await;
+    task_data_entries.invalidate(key).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protobuf::tonic_status_to_datafusion_error;
+    use datafusion::common::exec_datafusion_err;
+
+    #[test]
+    fn producer_failure_is_published_and_returned_to_coordinator() {
+        let entry = SingleWriteMultiRead::default();
+        let key = crate::TaskKey {
+            query_id: vec![1, 2, 3],
+            stage_id: 7,
+            task_number: 11,
+        };
+
+        let status = publish_task_data(
+            &entry,
+            &key,
+            Err(Arc::new(exec_datafusion_err!(
+                "injected plan decode failure"
+            ))),
+        )
+        .unwrap_err();
+
+        let coordinator_error = tonic_status_to_datafusion_error(status).unwrap();
+        assert!(
+            coordinator_error
+                .to_string()
+                .contains("injected plan decode failure")
+        );
+        let reader_error = entry.read_now().unwrap().unwrap_err();
+        assert!(
+            reader_error
+                .to_string()
+                .contains("injected plan decode failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_invalidates_published_plan() {
+        let worker = Worker::default();
+        let key = crate::TaskKey {
+            query_id: vec![1, 2, 3],
+            stage_id: 7,
+            task_number: 11,
+        };
+        worker
+            .task_data_entries
+            .insert(key.clone(), Arc::new(SingleWriteMultiRead::default()))
+            .await;
+
+        cancel_published_plan(&worker.task_data_entries, &worker.cancelled_task_keys, &key).await;
+
+        assert!(worker.task_data_entries.get(&key).await.is_none());
+        assert!(worker.cancelled_task_keys.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_publication_rejects_the_plan() {
+        let worker = Worker::default();
+        let key = crate::TaskKey {
+            query_id: vec![4, 5, 6],
+            stage_id: 8,
+            task_number: 12,
+        };
+
+        cancel_published_plan(&worker.task_data_entries, &worker.cancelled_task_keys, &key).await;
+        worker
+            .task_data_entries
+            .insert(key.clone(), Arc::new(SingleWriteMultiRead::default()))
+            .await;
+
+        let status =
+            ensure_plan_not_cancelled(&worker.task_data_entries, &worker.cancelled_task_keys, &key)
+                .await
+                .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Cancelled);
+        assert!(worker.task_data_entries.get(&key).await.is_none());
+    }
 }

@@ -10,7 +10,7 @@ use crate::worker::generated::worker as pb;
 use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
 use crate::worker::generated::worker::set_plan_request::WorkUnitFeedDeclaration;
 use crate::{
-    DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
+    ChannelResolver, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
     DistributedTaskContext, DistributedWorkUnitFeedContext, TaskKey,
     get_distributed_channel_resolver,
 };
@@ -29,11 +29,16 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use futures::StreamExt;
 use http::Extensions;
 use prost::Message;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Display;
+use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
 use tonic::metadata::MetadataMap;
@@ -44,6 +49,58 @@ use uuid::Uuid;
 /// send fewer bigger [crate::WorkUnit] batches over the wire, reducing the overhead of sending many
 /// small batches. See [StreamExt::ready_chunks] docs for more details about how chunking works.
 const WORK_UNIT_FEED_CHUNK_SIZE: usize = 256;
+const PLAN_PUBLICATION_TIMEOUT_SECS: u64 = 30;
+
+type PlanTaskChannels = (
+    UnboundedSender<pb::CoordinatorToWorkerMsg>,
+    UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
+    PlanPublication,
+    PlanCancellation,
+);
+
+pub(super) type PlanPublication = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+#[derive(Clone)]
+pub(super) struct PlanCancellation {
+    channel_resolver: Arc<dyn ChannelResolver + Send + Sync>,
+    coordinator_tx: UnboundedSender<pb::CoordinatorToWorkerMsg>,
+    task_key: TaskKey,
+    url: Url,
+}
+
+impl PlanCancellation {
+    pub(super) fn cancel_stream(&self) {
+        let _ = self.coordinator_tx.send(pb::CoordinatorToWorkerMsg {
+            inner: Some(Inner::CancelPlanRequest(pb::CancelPlanRequest {
+                task_key: Some(self.task_key.clone()),
+            })),
+        });
+    }
+
+    pub(super) async fn cancel(self) {
+        self.cancel_stream();
+        let Ok(Ok(mut client)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.channel_resolver.get_worker_client_for_url(&self.url),
+        )
+        .await
+        else {
+            return;
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.cancel_plan(pb::CancelPlanRequest {
+                task_key: Some(self.task_key),
+            }),
+        )
+        .await;
+    }
+
+    pub(super) fn cancel_in_background(self) {
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(self.cancel());
+    }
+}
 
 /// Metrics that measure network details about communications between [DistributedExec] and a
 /// worker.
@@ -121,12 +178,10 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         ctx: Arc<TaskContext>,
         task_i: usize,
         url: Url,
-    ) -> Result<(
-        UnboundedSender<pb::CoordinatorToWorkerMsg>,
-        UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
-    )> {
+    ) -> Result<PlanTaskChannels> {
         let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
         let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
+        let plan_publication_timeout = Duration::from_secs(PLAN_PUBLICATION_TIMEOUT_SECS);
 
         let mut work_unit_feed_declarations = vec![];
         let d_ctx = DistributedTaskContext {
@@ -161,6 +216,9 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         let plan_proto =
             PhysicalPlanNode::try_from_physical_plan(specialized.data, &codec)?.encode_to_vec();
         let plan_size = plan_proto.len();
+        let mut plan_hasher = DefaultHasher::new();
+        plan_proto.hash(&mut plan_hasher);
+        let plan_fingerprint = plan_hasher.finish();
 
         let task_key = TaskKey {
             query_id: serialize_uuid(&self.query_id),
@@ -182,8 +240,15 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             tokio::sync::mpsc::unbounded_channel();
         let (worker_to_coordinator_tx, worker_to_coordinator_rx) =
             tokio::sync::mpsc::unbounded_channel();
+        let (plan_publication_tx, plan_publication_rx) = oneshot::channel();
 
         let channel_resolver = get_distributed_channel_resolver(ctx.as_ref());
+        let plan_cancellation = PlanCancellation {
+            channel_resolver: Arc::clone(&channel_resolver),
+            coordinator_tx: coordinator_to_worker_tx.clone(),
+            task_key: task_key.clone(),
+            url: url.clone(),
+        };
 
         let mut headers = get_config_extension_propagation_headers(ctx.session_config())?;
         headers.extend(get_passthrough_headers(ctx.session_config()));
@@ -197,15 +262,49 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         );
 
         let metrics = self.metrics.clone();
+        let publication_task_key = task_key.clone();
+        let publication_url = url.clone();
 
         self.join_set.spawn(async move {
             let start = Instant::now();
-            let mut client = channel_resolver.get_worker_client_for_url(&url).await?;
-            let response = client.coordinator_channel(request).await.map_err(|e| {
-                tonic_status_to_datafusion_error(&e).unwrap_or_else(|| {
-                    exec_datafusion_err!("Error sending plan to worker {url}: {e}")
-                })
-            })?;
+            let response = tokio::time::timeout(plan_publication_timeout, async {
+                let mut client = channel_resolver
+                    .get_worker_client_for_url(&url)
+                    .await
+                    .map_err(|error| {
+                        exec_datafusion_err!(
+                            "Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker channel: {error}"
+                        )
+                    })?;
+                client
+                    .coordinator_channel(request)
+                    .await
+                    .map_err(|error| {
+                        tonic_status_to_datafusion_error(&error).unwrap_or_else(|| {
+                            exec_datafusion_err!(
+                                "Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=waiting for CoordinatorChannel acknowledgement: {error}"
+                            )
+                        })
+                    })
+            })
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) => Err(exec_datafusion_err!(
+                    "Plan publication timeout after {}s: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker and waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized",
+                    plan_publication_timeout.as_secs()
+                )),
+            };
+            let response = match response {
+                Ok(response) => {
+                    let _ = plan_publication_tx.send(Ok(()));
+                    response
+                }
+                Err(error) => {
+                    let _ = plan_publication_tx.send(Err(error));
+                    return Ok(());
+                }
+            };
             metrics.plan_send_latency.record(&start);
             metrics.plan_bytes_sent.add(plan_size);
             let mut worker_to_coordinator_stream = response.into_inner();
@@ -225,7 +324,22 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             Ok::<_, DataFusionError>(())
         });
 
-        Ok((coordinator_to_worker_tx, worker_to_coordinator_rx))
+        let plan_publication = Box::pin(async move {
+            plan_publication_rx
+                .await
+                .map_err(|_| {
+                    exec_datafusion_err!(
+                        "Plan publication task ended without acknowledgement: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={publication_url}, phase=waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized"
+                    )
+                })?
+        });
+
+        Ok((
+            coordinator_to_worker_tx,
+            worker_to_coordinator_rx,
+            plan_publication,
+            plan_cancellation,
+        ))
     }
 
     pub(super) fn metrics_collection_task(
@@ -258,20 +372,21 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     /// Launches the task that based on the different local [WorkUnitFeedExec] nodes, sends their
     /// inner [WorkUnitFeeds] over the network to their remote counterparts.
     ///
-    /// Once this function is called, all the [WorkUnitFeedExec]s feeds will be consumed.
+    /// The feeds are constructed when this function is called, but they are not consumed until all
+    /// worker plans report successful publication through `plans_published`.
     pub(super) fn work_unit_feed_task(
         &mut self,
         ctx: Arc<TaskContext>,
         task_i: usize,
         tx: UnboundedSender<pb::CoordinatorToWorkerMsg>,
+        mut plans_published: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
-
         let d_ctx = DistributedTaskContext {
             task_index: task_i,
             task_count: self.task_count,
         };
+        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
+        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
         let mut futures = vec![];
         self.plan.apply_with_dt_ctx(d_ctx, |plan, d_ctx| {
             let Some(wuf) = wuf_registry.get_work_unit_feed(plan) else {
@@ -313,6 +428,11 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             Ok(TreeNodeRecursion::Continue)
         })?;
         self.join_set.spawn(async move {
+            while !*plans_published.borrow_and_update() {
+                if plans_published.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
             futures::future::try_join_all(futures).await?;
             Ok(())
         });

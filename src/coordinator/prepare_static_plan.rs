@@ -40,6 +40,9 @@ pub(super) fn prepare_static_plan(
     let metrics = CoordinatorToWorkerMetrics::new(metrics);
 
     let mut join_set = JoinSet::new();
+    let mut plan_publications = Vec::new();
+    let mut plan_cancellations = Vec::new();
+    let (plans_published_tx, plans_published_rx) = tokio::sync::watch::channel(false);
     let prepared = Arc::clone(base_plan).transform_up(|plan| {
         // The following logic is just applied on network boundaries.
         let Some(plan) = plan.as_network_boundary() else {
@@ -87,9 +90,12 @@ pub(super) fn prepare_static_plan(
             workers.push(routed_url.clone());
             // Spawn a task that sends the subplan to the chosen URL.
             // There will be as many spawned tasks as workers.
-            let (tx, worker_rx) = spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
+            let (tx, worker_rx, plan_publication, plan_cancellation) =
+                spawner.send_plan_task(Arc::clone(ctx), i, routed_url)?;
+            plan_publications.push(plan_publication);
+            plan_cancellations.push(plan_cancellation);
             spawner.metrics_collection_task(i, worker_rx);
-            spawner.work_unit_feed_task(Arc::clone(ctx), i, tx)?;
+            spawner.work_unit_feed_task(Arc::clone(ctx), i, tx, plans_published_rx.clone())?;
         }
 
         Ok(Transformed::yes(plan.with_input_stage(Stage::Remote(
@@ -99,9 +105,21 @@ pub(super) fn prepare_static_plan(
                 workers,
             },
         ))?))
-    })?;
+    });
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            for cancellation in plan_cancellations {
+                cancellation.cancel_in_background();
+            }
+            return Err(error);
+        }
+    };
     Ok(PreparedPlan {
         head_stage: prepared.data,
         join_set,
+        plan_publications,
+        plan_cancellations,
+        plans_published_tx,
     })
 }

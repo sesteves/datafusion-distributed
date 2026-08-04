@@ -13,6 +13,7 @@ use datafusion::common::{Result, exec_err, internal_err};
 
 use crate::worker::generated::worker::ExecuteTaskRequest;
 use crate::worker::generated::worker::worker_service_server::WorkerService;
+use crate::worker::single_write_multi_read::SingleWriteMultiReadError;
 use crate::worker::spawn_select_all::spawn_select_all;
 use crate::worker::task_data::TaskDataMetrics;
 use datafusion::arrow::ipc::CompressionType;
@@ -24,6 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use prost::Message;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -35,6 +37,34 @@ use tonic::{Request, Response, Status};
 /// How many record batches to buffer from the plan execution.
 const RECORD_BATCH_BUFFER_SIZE: usize = 2;
 const WAIT_PLAN_TIMEOUT_SECS: u64 = 10;
+
+fn plan_publication_read_error(
+    error: SingleWriteMultiReadError,
+    key: &crate::TaskKey,
+    producer_head: &impl Debug,
+    timeout_secs: u64,
+) -> DataFusionError {
+    match error {
+        SingleWriteMultiReadError::Timeout => exec_datafusion_err!(
+            "Plan publication timeout after {timeout_secs}s: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
+            key.query_id,
+            key.stage_id,
+            key.task_number
+        ),
+        SingleWriteMultiReadError::NoValue => exec_datafusion_err!(
+            "Plan publication ended without a value: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
+            key.query_id,
+            key.stage_id,
+            key.task_number
+        ),
+        SingleWriteMultiReadError::AlreadyWritten => exec_datafusion_err!(
+            "Unexpected duplicate plan publication state while reading query_id={:?}, stage_id={}, task_id={}",
+            key.query_id,
+            key.stage_id,
+            key.task_number
+        ),
+    }
+}
 
 /// Builds several per-partition streams by retrieving the appropriate entry from [TaskDataEntries]
 /// based on the task key extracted from [ExecuteTaskRequest].
@@ -60,7 +90,9 @@ pub(crate) async fn execute_local_task(
     let task_data = entry
         .read(Duration::from_secs(WAIT_PLAN_TIMEOUT_SECS))
         .await
-        .map_err(|e| exec_datafusion_err!("Worker::execute_task timed-out while waiting for the plan to be set by the coordinator. ({e})"))?
+        .map_err(|error| {
+            plan_publication_read_error(error, &key, &producer_head, WAIT_PLAN_TIMEOUT_SECS)
+        })?
         .map_err(DataFusionError::Shared)?;
     task_data.task_data_metrics.mark_execution_started_once();
 
@@ -271,4 +303,47 @@ fn garbage_collect_arrays(batch: RecordBatch) -> Result<RecordBatch, DataFusionE
         arrays,
         &RecordBatchOptions::new().with_row_count(Some(row_count)),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_key() -> crate::TaskKey {
+        crate::TaskKey {
+            query_id: vec![1, 2, 3],
+            stage_id: 7,
+            task_number: 11,
+        }
+    }
+
+    #[test]
+    fn plan_publication_timeout_has_actionable_context() {
+        let error = plan_publication_read_error(
+            SingleWriteMultiReadError::Timeout,
+            &task_key(),
+            &"NoneHead",
+            3,
+        );
+        let message = error.to_string();
+
+        assert!(message.contains("Plan publication timeout after 3s"));
+        assert!(message.contains("stage_id=7"));
+        assert!(message.contains("task_id=11"));
+        assert!(message.contains("producer_head=\"NoneHead\""));
+        assert!(message.contains("last_completed_phase=ExecuteTask received"));
+    }
+
+    #[test]
+    fn closed_plan_publication_is_not_reported_as_timeout() {
+        let error = plan_publication_read_error(
+            SingleWriteMultiReadError::NoValue,
+            &task_key(),
+            &"NoneHead",
+            3,
+        );
+
+        assert!(error.to_string().contains("ended without a value"));
+        assert!(!error.to_string().contains("timeout"));
+    }
 }

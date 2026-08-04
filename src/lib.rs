@@ -20,7 +20,7 @@ pub mod test_utils;
 mod work_unit_feed;
 
 pub use arrow_ipc::CompressionType;
-pub use coordinator::DistributedExec;
+pub use coordinator::{DistributedExec, SetPlanProtoStats};
 pub use distributed_ext::DistributedExt;
 pub use distributed_planner::{
     DistributedConfig, NetworkBoundary, NetworkBoundaryExt, SessionStateBuilderExt,

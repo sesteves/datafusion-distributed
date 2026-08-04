@@ -1,4 +1,4 @@
-use crate::common::{TreeNodeExt, now_ns, serialize_uuid, task_ctx_with_extension};
+use crate::common::{TreeNodeExt, serialize_uuid, task_ctx_with_extension};
 use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
@@ -51,11 +51,11 @@ const WORK_UNIT_FEED_CHUNK_SIZE: usize = 256;
 pub(super) struct CoordinatorToWorkerMetrics {
     pub(super) plan_bytes_sent: Count,
     pub(super) plan_send_latency: Arc<LatencyMetric>,
-    pub(super) instantiation_time: u64,
+    pub(super) query_start_time_ns: u64,
 }
 
 impl CoordinatorToWorkerMetrics {
-    pub(super) fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
+    pub(super) fn new(metrics: &ExecutionPlanMetricsSet, query_start_time_ns: u64) -> Self {
         Self {
             // Metric that measures to total sum of bytes worth of subplans sent.
             plan_bytes_sent: MetricBuilder::new(metrics)
@@ -67,7 +67,7 @@ impl CoordinatorToWorkerMetrics {
                 |b| b.with_label(Label::new(DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, "0")),
                 metrics,
             )),
-            instantiation_time: now_ns(),
+            query_start_time_ns,
         }
     }
 }
@@ -85,10 +85,79 @@ pub(super) struct CoordinatorToWorkerTaskSpawner<'a> {
     query_id: Uuid,
     stage_id: usize,
     task_count: usize,
-    task_ctx: &'a TaskContext,
     metrics: &'a CoordinatorToWorkerMetrics,
     task_metrics: &'a Option<Arc<MetricsStore>>,
     join_set: &'a mut JoinSet<Result<()>>,
+}
+
+#[derive(Debug)]
+pub(super) struct SerializedTaskPlan {
+    pub(super) plan_proto: Vec<u8>,
+    work_unit_feed_declarations: Vec<WorkUnitFeedDeclaration>,
+}
+
+impl SerializedTaskPlan {
+    pub(super) fn into_set_plan_request(
+        self,
+        task_count: usize,
+        task_key: TaskKey,
+        target_worker_url: &Url,
+        query_start_time_ns: u64,
+    ) -> pb::SetPlanRequest {
+        pb::SetPlanRequest {
+            plan_proto: self.plan_proto,
+            task_count: task_count as u64,
+            task_key: Some(task_key),
+            work_unit_feed_declarations: self.work_unit_feed_declarations,
+            target_worker_url: target_worker_url.to_string(),
+            query_start_time_ns,
+        }
+    }
+}
+
+pub(super) fn serialize_task_plan(
+    plan: &Arc<dyn ExecutionPlan>,
+    task_count: usize,
+    task_i: usize,
+    task_ctx: &TaskContext,
+) -> Result<SerializedTaskPlan> {
+    let d_cfg = DistributedConfig::from_config_options(task_ctx.session_config().options())?;
+    let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
+    let mut work_unit_feed_declarations = vec![];
+    let d_ctx = DistributedTaskContext {
+        task_index: task_i,
+        task_count,
+    };
+
+    let specialized = Arc::clone(plan).transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
+        if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
+            work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
+                id: serialize_uuid(&wuf.id()),
+                partitions: plan.properties().partitioning.partition_count() as u64,
+            });
+        };
+
+        if let Some(ciu) = plan.downcast_ref::<ChildrenIsolatorUnionExec>() {
+            let ciu = ciu.to_task_specialized(d_ctx.task_index);
+            return Ok(Transformed::yes(Arc::new(ciu)));
+        };
+
+        if let Some(dle) = plan.downcast_ref::<DistributedLeafExec>() {
+            let specialized = dle.to_task_specialized(d_ctx.task_index);
+            return Ok(Transformed::yes(specialized));
+        }
+
+        Ok(Transformed::no(plan))
+    })?;
+
+    let codec = DistributedCodec::new_combined_with_user(task_ctx.session_config());
+    let plan_proto =
+        PhysicalPlanNode::try_from_physical_plan(specialized.data, &codec)?.encode_to_vec();
+
+    Ok(SerializedTaskPlan {
+        plan_proto,
+        work_unit_feed_declarations,
+    })
 }
 
 impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
@@ -98,7 +167,6 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         stage: &'a LocalStage,
         metrics: &'a CoordinatorToWorkerMetrics,
         task_metrics: &'a Option<Arc<MetricsStore>>,
-        task_ctx: &'a TaskContext,
         join_set: &'a mut JoinSet<Result<()>>,
     ) -> Result<Self> {
         Ok(Self {
@@ -106,7 +174,6 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             query_id: stage.query_id,
             stage_id: stage.num,
             task_count: stage.tasks,
-            task_ctx,
             metrics,
             task_metrics,
             join_set,
@@ -121,61 +188,26 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         ctx: Arc<TaskContext>,
         task_i: usize,
         url: Url,
+        serialized: SerializedTaskPlan,
     ) -> Result<(
         UnboundedSender<pb::CoordinatorToWorkerMsg>,
         UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
     )> {
-        let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
-        let wuf_registry = &d_cfg.__private_work_unit_feed_registry;
-
-        let mut work_unit_feed_declarations = vec![];
-        let d_ctx = DistributedTaskContext {
-            task_index: task_i,
-            task_count: self.task_count,
-        };
-
-        let plan = Arc::clone(self.plan);
-        let specialized = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
-            if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
-                work_unit_feed_declarations.push(WorkUnitFeedDeclaration {
-                    id: serialize_uuid(&wuf.id()),
-                    partitions: plan.properties().partitioning.partition_count() as u64,
-                });
-            };
-
-            if let Some(ciu) = plan.downcast_ref::<ChildrenIsolatorUnionExec>() {
-                let ciu = ciu.to_task_specialized(d_ctx.task_index);
-                return Ok(Transformed::yes(Arc::new(ciu)));
-            };
-
-            if let Some(dle) = plan.downcast_ref::<DistributedLeafExec>() {
-                let specialized = dle.to_task_specialized(d_ctx.task_index);
-                return Ok(Transformed::yes(specialized));
-            }
-
-            Ok(Transformed::no(plan))
-        })?;
-
-        let codec = DistributedCodec::new_combined_with_user(self.task_ctx.session_config());
-
-        let plan_proto =
-            PhysicalPlanNode::try_from_physical_plan(specialized.data, &codec)?.encode_to_vec();
-        let plan_size = plan_proto.len();
+        let plan_size = serialized.plan_proto.len();
 
         let task_key = TaskKey {
             query_id: serialize_uuid(&self.query_id),
             stage_id: self.stage_id as u64,
             task_number: task_i as u64,
         };
+        let request = serialized.into_set_plan_request(
+            self.task_count,
+            task_key,
+            &url,
+            self.metrics.query_start_time_ns,
+        );
         let msg = pb::CoordinatorToWorkerMsg {
-            inner: Some(Inner::SetPlanRequest(pb::SetPlanRequest {
-                plan_proto,
-                task_count: self.task_count as u64,
-                task_key: Some(task_key.clone()),
-                work_unit_feed_declarations,
-                target_worker_url: url.to_string(),
-                query_start_time_ns: self.metrics.instantiation_time,
-            })),
+            inner: Some(Inner::SetPlanRequest(request)),
         };
 
         let (coordinator_to_worker_tx, coordinator_to_worker_rx) =

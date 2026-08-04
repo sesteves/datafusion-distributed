@@ -6,6 +6,8 @@ service WorkerService {
   // will be exchanged at any time during a query's lifetime. It's expected to be one coordinator channel
   // per task.
   rpc CoordinatorChannel(stream CoordinatorToWorkerMsg) returns (stream WorkerToCoordinatorMsg);
+  // Cancels a published plan that will not be executed because another task failed publication.
+  rpc CancelPlan(CancelPlanRequest) returns (CancelPlanResponse);
   // Executes the requested partition range of a subplan previously sent by the coordinator channel.
   rpc ExecuteTask(ExecuteTaskRequest) returns (stream FlightData);
   // Returns metadata about a worker. Currently only used for worker versioning.
@@ -21,8 +23,17 @@ message CoordinatorToWorkerMsg {
     // set_plan_request. A work unit feed is a per-partition stream of information that tells the node what should
     // be executed within a partition, for example, a stream of file addresses that should be read.
     WorkUnitBatch work_unit_batch = 2;
+    // Cancels a plan that was published but will not be executed because another task's plan
+    // publication failed. Older coordinators may omit the TaskKey on their keyed channel.
+    CancelPlanRequest cancel_plan_request = 3;
   }
 }
+
+message CancelPlanRequest {
+  TaskKey task_key = 1;
+}
+
+message CancelPlanResponse {}
 
 message WorkerToCoordinatorMsg {
   oneof inner {

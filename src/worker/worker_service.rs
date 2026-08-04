@@ -1,8 +1,10 @@
 use crate::worker::WorkerSessionBuilder;
 use crate::worker::generated::worker::worker_service_server::{WorkerService, WorkerServiceServer};
 use crate::worker::generated::worker::{
-    CoordinatorToWorkerMsg, ExecuteTaskRequest, TaskKey, WorkerToCoordinatorMsg,
+    CancelPlanRequest, CancelPlanResponse, CoordinatorToWorkerMsg, ExecuteTaskRequest, TaskKey,
+    WorkerToCoordinatorMsg,
 };
+use crate::worker::impl_coordinator_channel::cancel_published_plan;
 use crate::worker::impl_execute_task::execute_remote_task;
 use crate::worker::single_write_multi_read::SingleWriteMultiRead;
 use crate::worker::task_data::TaskData;
@@ -23,6 +25,7 @@ use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status, Streaming};
 
 const TASK_CACHE_TTI: Duration = Duration::from_mins(10);
+const CANCELLED_TASK_CACHE_TTI: Duration = Duration::from_mins(10);
 
 #[allow(clippy::type_complexity)]
 #[derive(Clone, Default)]
@@ -33,6 +36,7 @@ pub(super) struct WorkerHooks {
 
 pub(crate) type ResultTaskData = Result<TaskData, Arc<DataFusionError>>;
 pub(crate) type TaskDataEntries = Cache<TaskKey, Arc<SingleWriteMultiRead<ResultTaskData>>>;
+pub(crate) type CancelledTaskKeys = Cache<TaskKey, ()>;
 
 #[derive(Clone)]
 pub struct Worker {
@@ -41,6 +45,7 @@ pub struct Worker {
     /// TASK_CACHE_TTI seconds. This prevents memory leaks from abandoned or incomplete queries
     /// while allowing concurrent access to task results across multiple partition requests.
     pub(super) task_data_entries: Arc<TaskDataEntries>,
+    pub(super) cancelled_task_keys: Arc<CancelledTaskKeys>,
     pub(super) session_builder: Arc<dyn WorkerSessionBuilder + Send + Sync>,
     pub(super) hooks: WorkerHooks,
     pub(super) max_message_size: Option<usize>,
@@ -50,9 +55,13 @@ pub struct Worker {
 impl Default for Worker {
     fn default() -> Self {
         let cache = Cache::builder().time_to_idle(TASK_CACHE_TTI).build();
+        let cancelled_task_keys = Cache::builder()
+            .time_to_idle(CANCELLED_TASK_CACHE_TTI)
+            .build();
         Self {
             runtime: Arc::new(RuntimeEnv::default()),
             task_data_entries: Arc::new(cache),
+            cancelled_task_keys: Arc::new(cancelled_task_keys),
             session_builder: Arc::new(DefaultSessionBuilder),
             hooks: WorkerHooks::default(),
             max_message_size: Some(usize::MAX),
@@ -195,6 +204,18 @@ impl WorkerService for Worker {
         execute_remote_task(&self.task_data_entries, request).await
     }
 
+    async fn cancel_plan(
+        &self,
+        request: Request<CancelPlanRequest>,
+    ) -> Result<Response<CancelPlanResponse>, Status> {
+        let key = request
+            .into_inner()
+            .task_key
+            .ok_or_else(|| Status::invalid_argument("Missing field 'task_key'"))?;
+        cancel_published_plan(&self.task_data_entries, &self.cancelled_task_keys, &key).await;
+        Ok(Response::new(CancelPlanResponse {}))
+    }
+
     async fn get_worker_info(
         &self,
         _request: Request<GetWorkerInfoRequest>,
@@ -202,5 +223,47 @@ impl WorkerService for Worker {
         Ok(Response::new(GetWorkerInfoResponse {
             version: self.version.to_string(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancel_plan_invalidates_the_keyed_entry() {
+        let worker = Worker::default();
+        let task_key = TaskKey {
+            query_id: vec![1; 16],
+            stage_id: 2,
+            task_number: 3,
+        };
+        worker
+            .task_data_entries
+            .insert(task_key.clone(), Arc::new(SingleWriteMultiRead::new()))
+            .await;
+
+        WorkerService::cancel_plan(
+            &worker,
+            Request::new(CancelPlanRequest {
+                task_key: Some(task_key.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(worker.task_data_entries.get(&task_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_plan_requires_a_task_key() {
+        let status = WorkerService::cancel_plan(
+            &Worker::default(),
+            Request::new(CancelPlanRequest { task_key: None }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 }

@@ -3,6 +3,7 @@ use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_static_plan::{
     PreparedStaticPlan, prepare_static_plan, publish_prepared_plan,
 };
+use crate::coordinator::task_spawner::{PlanCancellation, PlanPublication};
 use crate::distributed_planner::NetworkBoundaryExt;
 use crate::worker::generated::worker::TaskKey;
 use datafusion::common::internal_datafusion_err;
@@ -63,6 +64,23 @@ pub struct SetPlanProtoStats {
 pub(super) struct PreparedPlan {
     pub(super) head_stage: Arc<dyn ExecutionPlan>,
     pub(super) join_set: JoinSet<Result<()>>,
+    pub(super) plan_publications: Vec<PlanPublication>,
+    pub(super) plan_cancellations: Vec<PlanCancellation>,
+    pub(super) plans_published_tx: tokio::sync::watch::Sender<bool>,
+}
+
+async fn await_plan_publications(plan_publications: Vec<PlanPublication>) -> Result<()> {
+    let mut pending = futures::stream::FuturesUnordered::from_iter(plan_publications);
+    while let Some(publication) = pending.next().await {
+        publication?;
+    }
+    Ok(())
+}
+
+fn cancel_published_plans(plan_cancellations: Vec<PlanCancellation>) {
+    for cancellation in plan_cancellations {
+        cancellation.cancel_in_background();
+    }
 }
 
 impl DistributedExec {
@@ -265,6 +283,9 @@ impl ExecutionPlan for DistributedExec {
         let PreparedPlan {
             head_stage,
             join_set,
+            plan_publications,
+            plan_cancellations,
+            plans_published_tx,
         } = publish_prepared_plan(
             prepared_static_plan,
             &self.metrics,
@@ -280,8 +301,17 @@ impl ExecutionPlan for DistributedExec {
         }
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
-        // Spawn the task that pulls data from child...
+        // Wait for every worker to publish its plan before execution can issue
+        // ExecuteTask RPCs through the network boundaries.
         builder.spawn(async move {
+            if let Err(error) = await_plan_publications(plan_publications).await {
+                cancel_published_plans(plan_cancellations);
+                return Err(error);
+            }
+            // Cancellation handles retain coordinator senders, so release them once publication
+            // succeeds to let completed work unit feeds close their worker streams.
+            drop(plan_cancellations);
+            let _ = plans_published_tx.send(true);
             let mut stream = head_stage.execute(partition, context)?;
             while let Some(msg) = stream.next().await {
                 if tx.send(msg).await.is_err() {
@@ -290,10 +320,13 @@ impl ExecutionPlan for DistributedExec {
             }
             Ok(())
         });
-        // ...in parallel to the one that feeds the plan to workers.
+        // Coordinator channels remain open for work unit feeds and task metrics.
         builder.spawn(async move {
-            for res in join_set.join_all().await {
-                res?;
+            let mut join_set = join_set;
+            while let Some(result) = join_set.join_next().await {
+                result.map_err(|error| {
+                    internal_datafusion_err!("Coordinator task failed: {error}")
+                })??;
             }
             Ok(())
         });
@@ -307,8 +340,11 @@ impl ExecutionPlan for DistributedExec {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::memory::DataSourceExec;
+    use datafusion::common::exec_datafusion_err;
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
     use datafusion::execution::SessionStateBuilder;
@@ -477,5 +513,76 @@ mod tests {
 
         assert!(prepared.query_start_time_ns >= before);
         assert!(prepared.query_start_time_ns <= after);
+    }
+
+    #[tokio::test]
+    async fn waits_for_every_plan_publication() {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (last_tx, last_rx) = tokio::sync::oneshot::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_clone = Arc::clone(&completed);
+
+        #[allow(clippy::disallowed_methods)]
+        let waiter = tokio::spawn(async move {
+            await_plan_publications(vec![
+                Box::pin(async move { first_rx.await.unwrap() }),
+                Box::pin(async move { last_rx.await.unwrap() }),
+            ])
+            .await
+            .unwrap();
+            completed_clone.store(true, Ordering::SeqCst);
+        });
+
+        first_tx.send(Ok(())).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!completed.load(Ordering::SeqCst));
+
+        last_tx.send(Ok(())).unwrap();
+        waiter.await.unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn propagates_plan_publication_failure() {
+        let publication =
+            Box::pin(async { Err(exec_datafusion_err!("injected publication failure")) });
+
+        let error = await_plan_publications(vec![publication])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected publication failure"));
+    }
+
+    #[tokio::test]
+    async fn publication_failure_is_not_blocked_by_pending_sibling() {
+        let pending = Box::pin(std::future::pending());
+        let failed = Box::pin(async { Err(exec_datafusion_err!("later publication failed")) });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            await_plan_publications(vec![pending, failed]),
+        )
+        .await
+        .expect("Publication failure should be fail-fast")
+        .unwrap_err();
+        assert!(error.to_string().contains("later publication failed"));
+    }
+
+    #[tokio::test]
+    async fn reports_plan_publication_task_cancellation() {
+        let publication = Box::pin(async {
+            Err(internal_datafusion_err!(
+                "Plan publication task ended without reporting acknowledgement"
+            ))
+        });
+
+        let error = await_plan_publications(vec![publication])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ended without reporting acknowledgement")
+        );
     }
 }

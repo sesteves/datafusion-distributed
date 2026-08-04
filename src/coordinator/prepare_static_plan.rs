@@ -158,29 +158,51 @@ pub(super) fn publish_prepared_plan(
 ) -> Result<PreparedPlan> {
     let metrics = CoordinatorToWorkerMetrics::new(metrics, prepared.query_start_time_ns);
     let mut join_set = JoinSet::new();
+    let mut plan_publications = Vec::new();
+    let mut plan_cancellations = Vec::new();
+    let (plans_published_tx, plans_published_rx) = tokio::sync::watch::channel(false);
 
-    for prepared_stage in prepared.stages {
-        let mut spawner = CoordinatorToWorkerTaskSpawner::new(
-            &prepared_stage.stage,
-            &metrics,
-            task_metrics,
-            &mut join_set,
-        )?;
-        for task in prepared_stage.tasks {
-            let (tx, worker_rx) = spawner.send_plan_task(
-                Arc::clone(ctx),
-                task.task_index,
-                task.worker_url,
-                task.serialized_plan,
+    let setup_result = (|| -> Result<()> {
+        for prepared_stage in prepared.stages {
+            let mut spawner = CoordinatorToWorkerTaskSpawner::new(
+                &prepared_stage.stage,
+                &metrics,
+                task_metrics,
+                &mut join_set,
             )?;
-            spawner.metrics_collection_task(task.task_index, worker_rx);
-            spawner.work_unit_feed_task(Arc::clone(ctx), task.task_index, tx)?;
+            for task in prepared_stage.tasks {
+                let (tx, worker_rx, plan_publication, plan_cancellation) = spawner.send_plan_task(
+                    Arc::clone(ctx),
+                    task.task_index,
+                    task.worker_url,
+                    task.serialized_plan,
+                )?;
+                plan_publications.push(plan_publication);
+                plan_cancellations.push(plan_cancellation);
+                spawner.metrics_collection_task(task.task_index, worker_rx);
+                spawner.work_unit_feed_task(
+                    Arc::clone(ctx),
+                    task.task_index,
+                    tx,
+                    plans_published_rx.clone(),
+                )?;
+            }
         }
+        Ok(())
+    })();
+    if let Err(error) = setup_result {
+        for cancellation in plan_cancellations {
+            cancellation.cancel_in_background();
+        }
+        return Err(error);
     }
 
     Ok(PreparedPlan {
         head_stage: prepared.head_stage,
         join_set,
+        plan_publications,
+        plan_cancellations,
+        plans_published_tx,
     })
 }
 

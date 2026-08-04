@@ -1,0 +1,31 @@
+src/coordinator/distributed.rs
+  s_c3aaeedba29a5c::t_e80025812dd36f 4,39-53,172-174,185-186,188-192,201,203-207,218-295
+src/coordinator/prepare_static_plan.rs
+  s_c3aaeedba29a5c::t_8bbc9f6ae53d70 43-45,93-96,98,108-117,121-123
+src/worker/generated/worker.rs
+  s_c3aaeedba29a5c::t_8660435903b0f6 4,20-23,26-32,557-572,634-638,770-808
+src/worker/impl_coordinator_channel.rs
+  s_c3aaeedba29a5c::t_20817251ef3ac4 2,11,13,47,121-122,126-128,133-146,148-153,177-300
+src/worker/impl_execute_task.rs
+  s_c3aaeedba29a5c::t_5f8a40813b8821 16,28,41-68,93-95,307-349
+src/worker/worker.proto
+  s_c3aaeedba29a5c::t_6bf494542c63b3 9-10,26-28,32-37,347
+src/worker/worker_service.rs
+  s_c3aaeedba29a5c::t_8935f9738ca28d 4-5,7,28,39,48,58-60,64,207-218,228-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2a8f79e5a103f927ae33dd8bd8afffae2a579405",
+  "prompts": {},
+  "sessions": {
+    "s_c3aaeedba29a5c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_034e54aa4fferCwZ8rVCqmP2OY",
+        "model": "claude-haiku-4-5"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

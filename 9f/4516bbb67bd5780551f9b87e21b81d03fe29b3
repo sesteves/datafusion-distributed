@@ -1,0 +1,42 @@
+src/worker/impl_execute_task.rs
+  s_247d18633d0add::t_5d54da94be2de1 6,16,28,41-68,93-95,307-350
+src/worker/impl_coordinator_channel.rs
+  s_247d18633d0add::t_5d54da94be2de1 2,11,13,47,121-122,126-128,133-146,148-153,177-300
+src/coordinator/distributed.rs
+  s_247d18633d0add::t_5d54da94be2de1 6,67-83,304-305,307-310,314,323,325-329,517-587
+  s_247d18633d0add::t_f7c47bf4e65e55 286-288,343-344,347
+  s_247d18633d0add::t_f8d0ceb50a5087 311-313
+src/worker/worker_service.rs
+  s_247d18633d0add::t_5d54da94be2de1 4-5,7,28,39,48,58-60,64,207-218,228-268
+  s_247d18633d0add::t_b0b12a59c2d121 269
+src/lib.rs
+  s_247d18633d0add::t_5d54da94be2de1 22-24
+src/worker/generated/worker.rs
+  s_247d18633d0add::t_5d54da94be2de1 4,20-23,26-32,557-572,634-638,770-808
+src/coordinator/task_spawner.rs
+  s_247d18633d0add::t_460957e26ea433 263
+  s_247d18633d0add::t_a984838df7dd3c 266,276
+  s_247d18633d0add::t_5d54da94be2de1 13-14,32,34-36,41,52-116,262,265,267,288,291-296,310-311,315-353,373-388,421-422,428,434-435,477-481,543-568
+src/worker/worker.proto
+  s_247d18633d0add::t_5d54da94be2de1 9-10,26-28,32-37,347
+src/coordinator/prepare_static_plan.rs
+  s_247d18633d0add::t_512ed4636cc493 161-171,173,180-195,197
+  s_247d18633d0add::t_ea2c34911b5377 174-179
+  s_247d18633d0add::t_5d54da94be2de1 203-205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9f4516bbb67bd5780551f9b87e21b81d03fe29b3",
+  "prompts": {},
+  "sessions": {
+    "s_247d18633d0add": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_033a43c22ffe5AU0STjwiFCNGU",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

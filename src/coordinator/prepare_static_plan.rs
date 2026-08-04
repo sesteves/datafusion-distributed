@@ -3,6 +3,7 @@ use crate::coordinator::distributed::PreparedPlan;
 use crate::coordinator::task_spawner::{
     CoordinatorToWorkerMetrics, CoordinatorToWorkerTaskSpawner,
 };
+use crate::plan_telemetry::{DistributedPlanTelemetryGuard, DistributedPlanTelemetryState};
 use crate::stage::RemoteStage;
 use crate::{
     DistributedConfig, NetworkBoundaryExt, Stage, TaskEstimator, TaskRoutingContext,
@@ -33,9 +34,24 @@ pub(super) fn prepare_static_plan(
     task_metrics: &Option<Arc<MetricsStore>>,
     ctx: &Arc<TaskContext>,
 ) -> Result<PreparedPlan> {
-    let worker_resolver = get_distributed_worker_resolver(ctx.session_config())?;
-
-    let available_urls = worker_resolver.get_urls()?;
+    let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
+    let plan_telemetry =
+        DistributedPlanTelemetryState::new(d_cfg.__private_plan_telemetry_observer.0.clone(), 0);
+    let worker_resolver = match get_distributed_worker_resolver(ctx.session_config()) {
+        Ok(worker_resolver) => worker_resolver,
+        Err(error) => {
+            plan_telemetry.finish(crate::PlanPublicationOutcome::Other);
+            return Err(error);
+        }
+    };
+    let available_urls = match worker_resolver.get_urls() {
+        Ok(available_urls) => available_urls,
+        Err(error) => {
+            plan_telemetry.finish(crate::PlanPublicationOutcome::Other);
+            return Err(error);
+        }
+    };
+    plan_telemetry.set_worker_pool_size(available_urls.len());
 
     let metrics = CoordinatorToWorkerMetrics::new(metrics);
 
@@ -52,12 +68,19 @@ pub(super) fn prepare_static_plan(
         let Stage::Local(stage) = plan.input_stage() else {
             return exec_err!("Input stage from network boundary was not in Local state");
         };
+        plan_telemetry.stage_started();
 
         let d_cfg = DistributedConfig::from_config_options(ctx.session_config().options())?;
         let task_estimator = &d_cfg.__private_task_estimator;
 
-        let mut spawner =
-            CoordinatorToWorkerTaskSpawner::new(stage, &metrics, task_metrics, ctx, &mut join_set)?;
+        let mut spawner = CoordinatorToWorkerTaskSpawner::new(
+            stage,
+            &metrics,
+            task_metrics,
+            ctx,
+            &mut join_set,
+            Arc::clone(&plan_telemetry),
+        )?;
 
         let routed_urls = match task_estimator.route_tasks(&TaskRoutingContext {
             task_ctx: Arc::clone(ctx),
@@ -112,6 +135,7 @@ pub(super) fn prepare_static_plan(
             for cancellation in plan_cancellations {
                 cancellation.cancel_in_background();
             }
+            plan_telemetry.finish(crate::PlanPublicationOutcome::Other);
             return Err(error);
         }
     };
@@ -121,5 +145,6 @@ pub(super) fn prepare_static_plan(
         plan_publications,
         plan_cancellations,
         plans_published_tx,
+        plan_telemetry: DistributedPlanTelemetryGuard::new(plan_telemetry),
     })
 }

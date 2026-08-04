@@ -1,4 +1,5 @@
 use crate::common::deserialize_uuid;
+use crate::plan_telemetry::{WorkerTaskPlanTelemetry, notify_observer};
 use crate::protobuf::datafusion_error_to_tonic_status;
 use crate::work_unit_feed::{RemoteWorkUnitFeedRegistry, set_work_unit_received_time};
 use crate::worker::LocalWorkerContext;
@@ -23,9 +24,12 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, Streaming};
 use url::Url;
+
+const WORKER_PUBLICATION_NANOS_HEADER: &str = "x-datafusion-worker-plan-publication-nanos";
 
 impl Worker {
     pub(super) async fn impl_coordinator_channel(
@@ -44,7 +48,20 @@ impl Worker {
             ));
         };
         let key = request.task_key.ok_or_else(missing("task_key"))?;
-        ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key).await?;
+        let publication_start = Instant::now();
+        let serialized_bytes = request.plan_proto.len();
+        if let Err(error) =
+            ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key)
+                .await
+        {
+            self.observe_worker_plan(
+                key,
+                serialized_bytes,
+                publication_start.elapsed(),
+                crate::PlanPublicationOutcome::Cancellation,
+            );
+            return Err(error);
+        }
 
         let entry = self
             .task_data_entries
@@ -118,8 +135,34 @@ impl Worker {
             })
         };
 
-        publish_task_data(&entry, &key, task_data().await.map_err(Arc::new))?;
-        ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key).await?;
+        if let Err(error) = publish_task_data(&entry, &key, task_data().await.map_err(Arc::new)) {
+            self.observe_worker_plan(
+                key,
+                serialized_bytes,
+                publication_start.elapsed(),
+                crate::PlanPublicationOutcome::Other,
+            );
+            return Err(error);
+        }
+        if let Err(error) =
+            ensure_plan_not_cancelled(&self.task_data_entries, &self.cancelled_task_keys, &key)
+                .await
+        {
+            self.observe_worker_plan(
+                key,
+                serialized_bytes,
+                publication_start.elapsed(),
+                crate::PlanPublicationOutcome::Cancellation,
+            );
+            return Err(error);
+        }
+        let publication_duration = publication_start.elapsed();
+        self.observe_worker_plan(
+            key.clone(),
+            serialized_bytes,
+            publication_duration,
+            crate::PlanPublicationOutcome::Success,
+        );
 
         // Continue reading remaining messages (work unit feed data) in the background.
         let mut work_unit_senders = remote_work_unit_feed_registry.senders;
@@ -167,7 +210,37 @@ impl Worker {
                 Err(_) => None, // channel dropped without sending any message
             }
         });
-        Ok(Response::new(metrics_stream.map(Ok).boxed()))
+        let mut response = Response::new(metrics_stream.map(Ok).boxed());
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(
+            publication_duration
+                .as_nanos()
+                .min(u64::MAX as u128)
+                .to_string(),
+        ) {
+            response
+                .metadata_mut()
+                .insert(WORKER_PUBLICATION_NANOS_HEADER, value);
+        }
+        Ok(response)
+    }
+
+    fn observe_worker_plan(
+        &self,
+        task_key: crate::TaskKey,
+        serialized_bytes: usize,
+        decode_publication_duration: std::time::Duration,
+        outcome: crate::PlanPublicationOutcome,
+    ) {
+        let Some(observer) = &self.plan_telemetry_observer else {
+            return;
+        };
+        let telemetry = WorkerTaskPlanTelemetry {
+            task_key,
+            serialized_bytes,
+            decode_publication_duration,
+            outcome,
+        };
+        notify_observer(|| observer.worker_task_plan_published(&telemetry));
     }
 }
 

@@ -6,6 +6,7 @@ mod distributed_ext;
 mod execution_plans;
 mod metrics;
 mod passthrough_headers;
+mod plan_telemetry;
 mod stage;
 mod worker;
 
@@ -42,6 +43,11 @@ pub use metrics::{
 pub use networking::{
     BoxCloneSyncChannel, ChannelResolver, DefaultChannelResolver, WorkerResolver,
     create_worker_client, get_distributed_channel_resolver, get_distributed_worker_resolver,
+};
+pub use plan_telemetry::{
+    DistributedPlanTelemetry, DistributedPlanTelemetryObserver, PlanPublicationOutcome,
+    PublishedTaskPlanTelemetry, SerializedTaskPlanTelemetry, WorkerTaskPlanTelemetry,
+    set_distributed_plan_telemetry_observer,
 };
 pub use stage::{
     DistributedTaskContext, Stage, display_plan_ascii, display_plan_graphviz, explain_analyze,

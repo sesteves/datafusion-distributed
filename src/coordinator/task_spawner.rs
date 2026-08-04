@@ -3,6 +3,10 @@ use crate::config_extension_ext::get_config_extension_propagation_headers;
 use crate::coordinator::MetricsStore;
 use crate::execution_plans::{ChildrenIsolatorUnionExec, DistributedLeafExec};
 use crate::passthrough_headers::get_passthrough_headers;
+use crate::plan_telemetry::{
+    DistributedPlanTelemetryState, PlanPublicationOutcome, PublishedTaskPlanTelemetry,
+    SerializedTaskPlanTelemetry,
+};
 use crate::protobuf::tonic_status_to_datafusion_error;
 use crate::stage::LocalStage;
 use crate::work_unit_feed::{build_work_unit_batch_msg, set_work_unit_send_time};
@@ -50,6 +54,7 @@ use uuid::Uuid;
 /// small batches. See [StreamExt::ready_chunks] docs for more details about how chunking works.
 const WORK_UNIT_FEED_CHUNK_SIZE: usize = 256;
 const PLAN_PUBLICATION_TIMEOUT_SECS: u64 = 30;
+const WORKER_PUBLICATION_NANOS_HEADER: &str = "x-datafusion-worker-plan-publication-nanos";
 
 fn plan_publication_status_error(
     error: tonic::Status,
@@ -64,6 +69,13 @@ fn plan_publication_status_error(
     )
 }
 
+fn plan_publication_status_outcome(error: &tonic::Status) -> PlanPublicationOutcome {
+    match error.code() {
+        tonic::Code::Cancelled => PlanPublicationOutcome::Cancellation,
+        _ => PlanPublicationOutcome::Other,
+    }
+}
+
 type PlanTaskChannels = (
     UnboundedSender<pb::CoordinatorToWorkerMsg>,
     UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
@@ -71,7 +83,22 @@ type PlanTaskChannels = (
     PlanCancellation,
 );
 
-pub(super) type PlanPublication = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub(super) type PlanPublication =
+    Pin<Box<dyn Future<Output = std::result::Result<(), PlanPublicationFailure>> + Send>>;
+
+#[derive(Debug)]
+pub(super) struct PlanPublicationFailure {
+    pub(super) error: DataFusionError,
+    pub(super) outcome: PlanPublicationOutcome,
+}
+
+impl std::fmt::Display for PlanPublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PlanPublicationFailure {}
 
 #[derive(Clone)]
 pub(super) struct PlanCancellation {
@@ -159,6 +186,7 @@ pub(super) struct CoordinatorToWorkerTaskSpawner<'a> {
     metrics: &'a CoordinatorToWorkerMetrics,
     task_metrics: &'a Option<Arc<MetricsStore>>,
     join_set: &'a mut JoinSet<Result<()>>,
+    plan_telemetry: Arc<DistributedPlanTelemetryState>,
 }
 
 impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
@@ -170,6 +198,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         task_metrics: &'a Option<Arc<MetricsStore>>,
         task_ctx: &'a TaskContext,
         join_set: &'a mut JoinSet<Result<()>>,
+        plan_telemetry: Arc<DistributedPlanTelemetryState>,
     ) -> Result<Self> {
         Ok(Self {
             plan: &stage.plan,
@@ -180,6 +209,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             metrics,
             task_metrics,
             join_set,
+            plan_telemetry,
         })
     }
 
@@ -202,6 +232,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             task_count: self.task_count,
         };
 
+        let serialization_start = Instant::now();
         let plan = Arc::clone(self.plan);
         let specialized = plan.transform_down_with_dt_ctx(d_ctx, |plan, d_ctx| {
             if let Some(wuf) = wuf_registry.get_work_unit_feed(&plan) {
@@ -238,6 +269,12 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             stage_id: self.stage_id as u64,
             task_number: task_i as u64,
         };
+        self.plan_telemetry
+            .task_serialized(SerializedTaskPlanTelemetry {
+                task_key: task_key.clone(),
+                serialized_bytes: plan_size,
+                serialization_duration: serialization_start.elapsed(),
+            });
         let msg = pb::CoordinatorToWorkerMsg {
             inner: Some(Inner::SetPlanRequest(pb::SetPlanRequest {
                 plan_proto,
@@ -275,47 +312,79 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
         );
 
         let metrics = self.metrics.clone();
+        let plan_telemetry = Arc::clone(&self.plan_telemetry);
         let publication_task_key = task_key.clone();
         let publication_url = url.clone();
 
         self.join_set.spawn(async move {
             let start = Instant::now();
+            let publication_start = Instant::now();
             let response = tokio::time::timeout(plan_publication_timeout, async {
                 let mut client = channel_resolver
                     .get_worker_client_for_url(&url)
                     .await
-                    .map_err(|error| {
-                        exec_datafusion_err!(
+                    .map_err(|error| PlanPublicationFailure {
+                        error: exec_datafusion_err!(
                             "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker channel: {error}"
-                        )
+                        ),
+                        outcome: PlanPublicationOutcome::Other,
                     })?;
-                client
+                let response = client
                     .coordinator_channel(request)
                     .await
-                    .map_err(|error| {
-                        plan_publication_status_error(
+                    .map_err(|error| PlanPublicationFailure {
+                        outcome: plan_publication_status_outcome(&error),
+                        error: plan_publication_status_error(
                             error,
                             &publication_task_key,
                             plan_fingerprint,
                             &url,
-                        )
-                    })
+                        ),
+                    })?;
+                let acknowledgement_duration = publication_start.elapsed();
+                let worker_duration = response
+                    .metadata()
+                    .get(WORKER_PUBLICATION_NANOS_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_nanos)
+                    .unwrap_or_default();
+                let transfer_duration = coordinator_transfer_duration(
+                    acknowledgement_duration,
+                    worker_duration,
+                );
+                Ok((response, transfer_duration, worker_duration))
             })
             .await;
             let response = match response {
                 Ok(response) => response,
-                Err(_) => Err(exec_datafusion_err!(
-                    "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication timeout after {}s: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker and waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized",
-                    plan_publication_timeout.as_secs()
-                )),
+                Err(_) => Err(PlanPublicationFailure {
+                    error: exec_datafusion_err!(
+                        "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication timeout after {}s: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker and waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized",
+                        plan_publication_timeout.as_secs()
+                    ),
+                    outcome: PlanPublicationOutcome::PublicationTimeout,
+                }),
             };
             let response = match response {
-                Ok(response) => {
+                Ok((response, transfer_duration, worker_duration)) => {
+                    plan_telemetry.task_published(PublishedTaskPlanTelemetry {
+                        task_key: publication_task_key,
+                        coordinator_transfer_duration: transfer_duration,
+                        worker_decode_publication_duration: worker_duration,
+                        outcome: PlanPublicationOutcome::Success,
+                    });
                     let _ = plan_publication_tx.send(Ok(()));
                     response
                 }
-                Err(error) => {
-                    let _ = plan_publication_tx.send(Err(error));
+                Err(failure) => {
+                    plan_telemetry.task_published(PublishedTaskPlanTelemetry {
+                        task_key: publication_task_key,
+                        coordinator_transfer_duration: publication_start.elapsed(),
+                        worker_decode_publication_duration: Duration::ZERO,
+                        outcome: failure.outcome,
+                    });
+                    let _ = plan_publication_tx.send(Err(failure));
                     return Ok(());
                 }
             };
@@ -342,9 +411,12 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             plan_publication_rx
                 .await
                 .map_err(|_| {
-                    exec_datafusion_err!(
-                        "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication task ended without acknowledgement: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={publication_url}, phase=waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized"
-                    )
+                    PlanPublicationFailure {
+                        error: exec_datafusion_err!(
+                            "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication task ended without acknowledgement: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={publication_url}, phase=waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized"
+                        ),
+                        outcome: PlanPublicationOutcome::Cancellation,
+                    }
                 })?
         });
 
@@ -454,6 +526,13 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
     }
 }
 
+fn coordinator_transfer_duration(
+    acknowledgement_duration: Duration,
+    worker_duration: Duration,
+) -> Duration {
+    acknowledgement_duration.saturating_sub(worker_duration)
+}
+
 /// DataFusion metrics system is pretty limited from an API standpoint. This intermediate struct
 /// bridges the gaps that are not satisfied by upstream API for measuring latency.
 pub(super) struct LatencyMetric {
@@ -532,5 +611,29 @@ mod tests {
         assert!(message.contains("worker plan decode failed"));
         assert!(message.contains("plan_fingerprint=0000000000001234"));
         assert!(message.contains("worker=http://worker.example:8080/"));
+    }
+
+    #[test]
+    fn coordinator_transfer_subtracts_worker_time_without_clock_sync() {
+        assert_eq!(
+            coordinator_transfer_duration(Duration::from_millis(25), Duration::from_millis(10)),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            coordinator_transfer_duration(Duration::from_millis(10), Duration::from_millis(25)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn publication_status_uses_bounded_terminal_categories() {
+        assert_eq!(
+            plan_publication_status_outcome(&tonic::Status::cancelled("cancelled")),
+            PlanPublicationOutcome::Cancellation
+        );
+        assert_eq!(
+            plan_publication_status_outcome(&tonic::Status::internal("failed")),
+            PlanPublicationOutcome::Other
+        );
     }
 }

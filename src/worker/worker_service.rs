@@ -9,8 +9,8 @@ use crate::worker::impl_execute_task::execute_remote_task;
 use crate::worker::single_write_multi_read::SingleWriteMultiRead;
 use crate::worker::task_data::TaskData;
 use crate::{
-    DefaultSessionBuilder, GetWorkerInfoRequest, GetWorkerInfoResponse, ObservabilityServiceImpl,
-    ObservabilityServiceServer, WorkerResolver,
+    DefaultSessionBuilder, DistributedPlanTelemetryObserver, GetWorkerInfoRequest,
+    GetWorkerInfoResponse, ObservabilityServiceImpl, ObservabilityServiceServer, WorkerResolver,
 };
 use arrow_flight::FlightData;
 use async_trait::async_trait;
@@ -50,6 +50,7 @@ pub struct Worker {
     pub(super) hooks: WorkerHooks,
     pub(super) max_message_size: Option<usize>,
     pub(super) version: Cow<'static, str>,
+    pub(super) plan_telemetry_observer: Option<Arc<dyn DistributedPlanTelemetryObserver>>,
 }
 
 impl Default for Worker {
@@ -66,6 +67,7 @@ impl Default for Worker {
             hooks: WorkerHooks::default(),
             max_message_size: Some(usize::MAX),
             version: Cow::Borrowed(""),
+            plan_telemetry_observer: None,
         }
     }
 }
@@ -167,6 +169,15 @@ impl Worker {
     /// Sets a version string reported by the `GetWorkerInfo` gRPC endpoint.
     pub fn with_version(mut self, version: impl Into<Cow<'static, str>>) -> Self {
         self.version = version.into();
+        self
+    }
+
+    /// Installs an observer for worker-side distributed plan publication telemetry.
+    pub fn with_plan_telemetry_observer(
+        mut self,
+        observer: Arc<dyn DistributedPlanTelemetryObserver>,
+    ) -> Self {
+        self.plan_telemetry_observer = Some(observer);
         self
     }
 

@@ -1,8 +1,9 @@
 use crate::common::{require_one_child, serialize_uuid};
 use crate::coordinator::metrics_store::MetricsStore;
 use crate::coordinator::prepare_static_plan::prepare_static_plan;
-use crate::coordinator::task_spawner::{PlanCancellation, PlanPublication};
+use crate::coordinator::task_spawner::{PlanCancellation, PlanPublication, PlanPublicationFailure};
 use crate::distributed_planner::NetworkBoundaryExt;
+use crate::plan_telemetry::DistributedPlanTelemetryGuard;
 use crate::worker::generated::worker::TaskKey;
 use datafusion::common::internal_datafusion_err;
 use datafusion::common::runtime::JoinSet;
@@ -39,9 +40,12 @@ pub(super) struct PreparedPlan {
     pub(super) plan_publications: Vec<PlanPublication>,
     pub(super) plan_cancellations: Vec<PlanCancellation>,
     pub(super) plans_published_tx: tokio::sync::watch::Sender<bool>,
+    pub(super) plan_telemetry: DistributedPlanTelemetryGuard,
 }
 
-async fn await_plan_publications(plan_publications: Vec<PlanPublication>) -> Result<()> {
+async fn await_plan_publications(
+    plan_publications: Vec<PlanPublication>,
+) -> std::result::Result<(), PlanPublicationFailure> {
     let mut pending = futures::stream::FuturesUnordered::from_iter(plan_publications);
     while let Some(publication) = pending.next().await {
         publication?;
@@ -174,23 +178,30 @@ impl ExecutionPlan for DistributedExec {
             plan_publications,
             plan_cancellations,
             plans_published_tx,
+            plan_telemetry,
         } = prepare_static_plan(&self.plan, &self.metrics, &self.metrics_store, &context)?;
-        {
-            let mut guard = self
-                .prepared_plan
-                .lock()
-                .map_err(|e| internal_datafusion_err!("Failed to lock prepared plan: {e}"))?;
-            *guard = Some(head_stage.clone());
-        }
+        let mut guard = match self.prepared_plan.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                plan_telemetry.finish(crate::PlanPublicationOutcome::Other);
+                return Err(internal_datafusion_err!(
+                    "Failed to lock prepared plan: {error}"
+                ));
+            }
+        };
+        *guard = Some(head_stage.clone());
+        drop(guard);
         let mut builder = RecordBatchReceiverStreamBuilder::new(self.schema(), 1);
         let tx = builder.tx();
         // Wait for every worker to publish its plan before execution can issue
         // ExecuteTask RPCs through the network boundaries.
         builder.spawn(async move {
-            if let Err(error) = await_plan_publications(plan_publications).await {
+            if let Err(failure) = await_plan_publications(plan_publications).await {
                 cancel_published_plans(plan_cancellations);
-                return Err(error);
+                plan_telemetry.finish(failure.outcome);
+                return Err(failure.error);
             }
+            plan_telemetry.finish(crate::PlanPublicationOutcome::Success);
             let _ = plans_published_tx.send(true);
             let mut stream = head_stage.execute(partition, context)?;
             while let Some(msg) = stream.next().await {
@@ -224,6 +235,13 @@ mod tests {
     use datafusion::common::exec_datafusion_err;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    fn publication_failure(message: &'static str) -> PlanPublicationFailure {
+        PlanPublicationFailure {
+            error: exec_datafusion_err!("{message}"),
+            outcome: crate::PlanPublicationOutcome::Other,
+        }
+    }
+
     #[tokio::test]
     async fn waits_for_every_plan_publication() {
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
@@ -254,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn propagates_plan_publication_failure() {
         let publication =
-            Box::pin(async { Err(exec_datafusion_err!("injected publication failure")) });
+            Box::pin(async { Err(publication_failure("injected publication failure")) });
 
         let error = await_plan_publications(vec![publication])
             .await
@@ -265,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn publication_failure_is_not_blocked_by_pending_sibling() {
         let pending = Box::pin(std::future::pending());
-        let failed = Box::pin(async { Err(exec_datafusion_err!("later publication failed")) });
+        let failed = Box::pin(async { Err(publication_failure("later publication failed")) });
 
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -280,9 +298,12 @@ mod tests {
     #[tokio::test]
     async fn reports_plan_publication_task_cancellation() {
         let publication = Box::pin(async {
-            Err(internal_datafusion_err!(
-                "Plan publication task ended without reporting acknowledgement"
-            ))
+            Err(PlanPublicationFailure {
+                error: internal_datafusion_err!(
+                    "Plan publication task ended without reporting acknowledgement"
+                ),
+                outcome: crate::PlanPublicationOutcome::Cancellation,
+            })
         });
 
         let error = await_plan_publications(vec![publication])

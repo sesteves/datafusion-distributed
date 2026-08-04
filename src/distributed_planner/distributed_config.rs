@@ -1,6 +1,7 @@
 use crate::TaskEstimator;
 use crate::distributed_planner::task_estimator::CombinedTaskEstimator;
 use crate::networking::{ChannelResolverExtension, WorkerResolverExtension};
+use crate::plan_telemetry::PlanTelemetryObserverExtension;
 use crate::work_unit_feed::WorkUnitFeedRegistry;
 use datafusion::common::utils::get_available_parallelism;
 use datafusion::common::{DataFusionError, extensions_options, not_impl_err, plan_err};
@@ -77,6 +78,8 @@ extensions_options! {
         /// [WorkUnitFeedRegistry] that contains a set of getters that, applied to each node in a
         /// plan, will return the [crate::WorkUnitFeed]s present in all nodes.
         pub(crate) __private_work_unit_feed_registry: WorkUnitFeedRegistry, default = WorkUnitFeedRegistry::default()
+        /// Observer for distributed plan serialization and publication telemetry.
+        pub(crate) __private_plan_telemetry_observer: PlanTelemetryObserverExtension, default = PlanTelemetryObserverExtension::default()
     }
 }
 

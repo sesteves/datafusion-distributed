@@ -3,7 +3,7 @@ use crate::metrics::proto::df_metrics_set_to_proto;
 use crate::protobuf::datafusion_error_to_tonic_status;
 use crate::worker::generated::worker::{FlightAppMetadata, TaskMetrics};
 use crate::worker::worker_service::{TaskDataEntries, Worker};
-use crate::{DistributedConfig, DistributedTaskContext};
+use crate::{DistributedConfig, DistributedTaskContext, PLAN_PUBLICATION_ERROR_PREFIX};
 use arrow_flight::encode::{DictionaryHandling, FlightDataEncoder, FlightDataEncoderBuilder};
 use arrow_flight::error::FlightError;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
@@ -46,13 +46,13 @@ fn plan_publication_read_error(
 ) -> DataFusionError {
     match error {
         SingleWriteMultiReadError::Timeout => exec_datafusion_err!(
-            "Plan publication timeout after {timeout_secs}s: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
+            "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication timeout after {timeout_secs}s: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
             key.query_id,
             key.stage_id,
             key.task_number
         ),
         SingleWriteMultiReadError::NoValue => exec_datafusion_err!(
-            "Plan publication ended without a value: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
+            "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication ended without a value: query_id={:?}, stage_id={}, task_id={}, producer_head={producer_head:?}, phase=ExecuteTask waiting for CoordinatorChannel acknowledgement, last_completed_phase=ExecuteTask received",
             key.query_id,
             key.stage_id,
             key.task_number
@@ -328,6 +328,7 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("Plan publication timeout after 3s"));
+        assert!(message.contains(PLAN_PUBLICATION_ERROR_PREFIX));
         assert!(message.contains("stage_id=7"));
         assert!(message.contains("task_id=11"));
         assert!(message.contains("producer_head=\"NoneHead\""));

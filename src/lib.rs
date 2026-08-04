@@ -19,6 +19,9 @@ mod coordinator;
 pub mod test_utils;
 mod work_unit_feed;
 
+/// Stable marker on execution errors caused by distributed plan publication failures.
+pub const PLAN_PUBLICATION_ERROR_PREFIX: &str = "[datafusion-distributed:plan-publication]";
+
 pub use arrow_ipc::CompressionType;
 pub use coordinator::DistributedExec;
 pub use distributed_ext::DistributedExt;

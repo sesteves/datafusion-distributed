@@ -11,7 +11,7 @@ use crate::worker::generated::worker::coordinator_to_worker_msg::Inner;
 use crate::worker::generated::worker::set_plan_request::WorkUnitFeedDeclaration;
 use crate::{
     ChannelResolver, DISTRIBUTED_DATAFUSION_TASK_ID_LABEL, DistributedCodec, DistributedConfig,
-    DistributedTaskContext, DistributedWorkUnitFeedContext, TaskKey,
+    DistributedTaskContext, DistributedWorkUnitFeedContext, PLAN_PUBLICATION_ERROR_PREFIX, TaskKey,
     get_distributed_channel_resolver,
 };
 use datafusion::common::Result;
@@ -273,7 +273,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
                     .await
                     .map_err(|error| {
                         exec_datafusion_err!(
-                            "Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker channel: {error}"
+                            "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker channel: {error}"
                         )
                     })?;
                 client
@@ -282,7 +282,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
                     .map_err(|error| {
                         tonic_status_to_datafusion_error(&error).unwrap_or_else(|| {
                             exec_datafusion_err!(
-                                "Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=waiting for CoordinatorChannel acknowledgement: {error}"
+                                "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=waiting for CoordinatorChannel acknowledgement: {error}"
                             )
                         })
                     })
@@ -291,7 +291,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
             let response = match response {
                 Ok(response) => response,
                 Err(_) => Err(exec_datafusion_err!(
-                    "Plan publication timeout after {}s: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker and waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized",
+                    "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication timeout after {}s: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=resolving worker and waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized",
                     plan_publication_timeout.as_secs()
                 )),
             };
@@ -329,7 +329,7 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
                 .await
                 .map_err(|_| {
                     exec_datafusion_err!(
-                        "Plan publication task ended without acknowledgement: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={publication_url}, phase=waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized"
+                        "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication task ended without acknowledgement: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={publication_url}, phase=waiting for CoordinatorChannel acknowledgement, last_completed_phase=plan serialized"
                     )
                 })?
         });

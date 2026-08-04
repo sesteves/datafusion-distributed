@@ -49,8 +49,10 @@ async fn await_plan_publications(plan_publications: Vec<PlanPublication>) -> Res
     Ok(())
 }
 
-async fn cancel_published_plans(plan_cancellations: Vec<PlanCancellation>) {
-    futures::future::join_all(plan_cancellations.into_iter().map(PlanCancellation::cancel)).await;
+fn cancel_published_plans(plan_cancellations: Vec<PlanCancellation>) {
+    for cancellation in plan_cancellations {
+        cancellation.cancel_in_background();
+    }
 }
 
 impl DistributedExec {
@@ -186,7 +188,7 @@ impl ExecutionPlan for DistributedExec {
         // ExecuteTask RPCs through the network boundaries.
         builder.spawn(async move {
             if let Err(error) = await_plan_publications(plan_publications).await {
-                cancel_published_plans(plan_cancellations).await;
+                cancel_published_plans(plan_cancellations);
                 return Err(error);
             }
             let _ = plans_published_tx.send(true);

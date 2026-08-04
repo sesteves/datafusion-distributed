@@ -51,6 +51,19 @@ use uuid::Uuid;
 const WORK_UNIT_FEED_CHUNK_SIZE: usize = 256;
 const PLAN_PUBLICATION_TIMEOUT_SECS: u64 = 30;
 
+fn plan_publication_status_error(
+    error: tonic::Status,
+    task_key: &TaskKey,
+    plan_fingerprint: u64,
+    worker: &Url,
+) -> DataFusionError {
+    let source = tonic_status_to_datafusion_error(&error)
+        .map_or_else(|| error.to_string(), |decoded| decoded.to_string());
+    exec_datafusion_err!(
+        "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication failed: task_key={task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={worker}, phase=waiting for CoordinatorChannel acknowledgement: {source}"
+    )
+}
+
 type PlanTaskChannels = (
     UnboundedSender<pb::CoordinatorToWorkerMsg>,
     UnboundedReceiver<pb::WorkerToCoordinatorMsg>,
@@ -280,11 +293,12 @@ impl<'a> CoordinatorToWorkerTaskSpawner<'a> {
                     .coordinator_channel(request)
                     .await
                     .map_err(|error| {
-                        tonic_status_to_datafusion_error(&error).unwrap_or_else(|| {
-                            exec_datafusion_err!(
-                                "{PLAN_PUBLICATION_ERROR_PREFIX} Plan publication failed: task_key={publication_task_key:?}, plan_fingerprint={plan_fingerprint:016x}, worker={url}, phase=waiting for CoordinatorChannel acknowledgement: {error}"
-                            )
-                        })
+                        plan_publication_status_error(
+                            error,
+                            &publication_task_key,
+                            plan_fingerprint,
+                            &url,
+                        )
                     })
             })
             .await;
@@ -492,5 +506,31 @@ impl LatencyMetric {
         self.max_latency_micros.fetch_max(micros, Ordering::Relaxed);
         self.sum_latency_micros.fetch_add(micros, Ordering::Relaxed);
         self.count_latency_micros.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protobuf::datafusion_error_to_tonic_status;
+
+    #[test]
+    fn worker_publication_error_is_tagged_with_coordinator_context() {
+        let task_key = TaskKey {
+            query_id: vec![1, 2, 3],
+            stage_id: 4,
+            task_number: 5,
+        };
+        let worker_error = exec_datafusion_err!("worker plan decode failed");
+        let status = datafusion_error_to_tonic_status(&worker_error);
+        let worker = Url::parse("http://worker.example:8080").unwrap();
+
+        let error = plan_publication_status_error(status, &task_key, 0x1234, &worker);
+        let message = error.to_string();
+
+        assert!(message.contains(PLAN_PUBLICATION_ERROR_PREFIX));
+        assert!(message.contains("worker plan decode failed"));
+        assert!(message.contains("plan_fingerprint=0000000000001234"));
+        assert!(message.contains("worker=http://worker.example:8080/"));
     }
 }

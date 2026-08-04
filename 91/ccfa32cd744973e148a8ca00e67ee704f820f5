@@ -1,0 +1,64 @@
+src/coordinator/mod.rs
+  s_2c97894b5ffbfe::t_dff4f848e109ae 6
+src/coordinator/distributed.rs
+  s_fc83456ec9e510::t_7bd408d05b0d1f 314,355,358-359,361,363-366,369,391
+  s_2c97894b5ffbfe::t_952ec4b3ffaed2 421-425
+  s_fc83456ec9e510::t_53e42f22c841f9 319,356-357,360
+  s_2c97894b5ffbfe::t_5d9a19c6a149c7 321
+  s_2c97894b5ffbfe::t_dff4f848e109ae 3-5,49,52-56,88,90-91,99,137,167,268-273,322,362,368,371,374,380-381,383-386,390,394,404,407-408
+  s_fc83456ec9e510::t_001d0cc0f8e924 51,57-62,89,307-310,317-318,320,324-334,350-354,367,370,372-373,375-379,382,387-389,395,403,405,481
+  s_fc83456ec9e510::t_56c50006678499 336
+  s_fc83456ec9e510::t_cadb2716fbc459 315
+  s_2c97894b5ffbfe::t_1441f4dd2c981a 48
+  s_2c97894b5ffbfe::t_fd08048169c459 50
+  s_2c97894b5ffbfe::t_357af3e99869a9 23
+  s_2c97894b5ffbfe::t_f17b6cbd3ac675 168,409-420,426-480
+  s_2c97894b5ffbfe::t_22c230525492c4 33,38-47,73,92-98,100-136,138-166,204-205,243,264
+  s_fc83456ec9e510::t_58433afe13e11a 311-313,316,335,337-349,392-393,396-402
+  s_2c97894b5ffbfe::t_c3479ea3135252 323
+  s_2c97894b5ffbfe::t_5c6cb6fd26d17c 169,406
+src/lib.rs
+  s_2c97894b5ffbfe::t_dff4f848e109ae 23
+src/coordinator/task_spawner.rs
+  s_2c97894b5ffbfe::t_22c230525492c4 1
+  s_2c97894b5ffbfe::t_4a68b67eb08619 93
+  s_fc83456ec9e510::t_001d0cc0f8e924 94-98,118-162
+  s_2c97894b5ffbfe::t_e9d1ec38cba718 99,101-117,203-206,208,210
+  s_2c97894b5ffbfe::t_dca305dbc50f00 100,196
+  s_2c97894b5ffbfe::t_c51dd7827d554b 191
+  s_2c97894b5ffbfe::t_8234db62a46faa 54,58,70,207
+src/coordinator/prepare_static_plan.rs
+  s_2c97894b5ffbfe::t_22c230525492c4 1,77,147,159
+  s_2c97894b5ffbfe::t_dca305dbc50f00 186-201,204-205,207-214,216-243,245-258,260-268,273-291,300-323,326-337
+  s_2c97894b5ffbfe::t_0f3ca2d043c2ba 202-203,206
+  s_2c97894b5ffbfe::t_952ec4b3ffaed2 292-296
+  s_2c97894b5ffbfe::t_4a68b67eb08619 22,29,35
+  s_2c97894b5ffbfe::t_5d9a19c6a149c7 25
+  s_2c97894b5ffbfe::t_c3479ea3135252 215,269-272,324-325
+  s_2c97894b5ffbfe::t_c51dd7827d554b 3,5-6,8,15,23-24,26-28,30-34,36-66,70,76,82,123,126-130,132-135,145,148-158,160-182
+  s_2c97894b5ffbfe::t_f17b6cbd3ac675 244,259,297-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "91ccfa32cd744973e148a8ca00e67ee704f820f5",
+  "prompts": {},
+  "sessions": {
+    "s_2c97894b5ffbfe": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_033da957effexQZL1OIgql5pN0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    },
+    "s_fc83456ec9e510": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0347b5d81ffezrnTqHAIeWT88I",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

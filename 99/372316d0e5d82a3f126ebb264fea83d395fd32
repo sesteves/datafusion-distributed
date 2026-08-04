@@ -1,0 +1,26 @@
+src/coordinator/distributed.rs
+  s_17a7bf1bd53b71::t_a38c6a1baccb5a 52-55,191
+src/lib.rs
+  s_17a7bf1bd53b71::t_a38c6a1baccb5a 22-24
+src/coordinator/task_spawner.rs
+  s_17a7bf1bd53b71::t_a38c6a1baccb5a 14,276,285,294,332
+src/worker/impl_execute_task.rs
+  s_17a7bf1bd53b71::t_2e32642914359c 331
+  s_17a7bf1bd53b71::t_a38c6a1baccb5a 6,49,55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "99372316d0e5d82a3f126ebb264fea83d395fd32",
+  "prompts": {},
+  "sessions": {
+    "s_17a7bf1bd53b71": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0378a5587ffe1BS7PvxEm8CrKH",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

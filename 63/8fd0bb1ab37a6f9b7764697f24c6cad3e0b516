@@ -1,0 +1,27 @@
+src/coordinator/distributed.rs
+  s_616178a749cc8f::t_eb6f24651af5c3 5,112,425-427
+tests/metrics_collection.rs
+  s_616178a749cc8f::t_eb6f24651af5c3 419-422
+src/protocol/worker_channel.rs
+  s_616178a749cc8f::t_eb6f24651af5c3 182
+src/coordinator/mod.rs
+  s_616178a749cc8f::t_eb6f24651af5c3 9
+src/lib.rs
+  s_616178a749cc8f::t_eb6f24651af5c3 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "638fd0bb1ab37a6f9b7764697f24c6cad3e0b516",
+  "prompts": {},
+  "sessions": {
+    "s_616178a749cc8f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f3262da12ffeWRNWmeT6I3nAsY",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+tests/metrics_collection.rs
+  s_616178a749cc8f::t_5b38d9ce6a53a3 25,383-385,388-399,404-416
+  s_616178a749cc8f::t_1a8eba164adcda 386-387,400-403
+  s_616178a749cc8f::t_a74ad7d86a4497 417-419
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ac654b00951dae3895255808b7ce04bb6c9d56ab",
+  "prompts": {},
+  "sessions": {
+    "s_616178a749cc8f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f3262da12ffeWRNWmeT6I3nAsY",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+src/coordinator/query_coordinator.rs
+  s_616178a749cc8f::t_24f4da1670b181 315-316,328-329,341,350-355
+tests/metrics_collection.rs
+  s_616178a749cc8f::t_af4b2d57f22669 21,389,412-417
+src/protocol/worker_channel.rs
+  s_616178a749cc8f::t_24f4da1670b181 167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5827fedb21411904ed1ca3bc31c72ec88e36dc86",
+  "prompts": {},
+  "sessions": {
+    "s_616178a749cc8f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f3262da12ffeWRNWmeT6I3nAsY",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}
